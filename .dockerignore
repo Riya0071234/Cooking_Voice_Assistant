@@ -1,0 +1,30 @@
+# Git files
+.git
+.gitignore
+.gitattributes
+
+# Docker files
+Dockerfile
+.dockerignore
+
+# Python virtual environment and cache
+.venv
+venv
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local data and logs - should not be part of the image
+data/
+logs/
+notebooks/
+
+# IDE and OS files
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local secrets
+.env

@@ -1,0 +1,68 @@
+# ===================================================
+# == Definitive Requirements for AI Cooking Assistant ==
+# ===================================================
+
+# -- Core & Utilities --
+numpy==1.26.4
+pandas==2.2.2
+PyYAML==6.0.1
+loguru==0.7.2
+python-dotenv==1.0.1
+tqdm==4.66.4
+isodate==0.6.1 # For parsing YouTube video duration
+
+# -- Database --
+SQLAlchemy==2.0.30
+psycopg2-binary==2.9.9
+
+# -- Scraping --
+requests==2.32.3
+beautifulsoup4==4.12.3
+# --- YouTube ---
+google-api-python-client==2.134.0
+youtube-transcript-api==0.6.2
+pytube==15.0.0
+# --- Reddit ---
+praw==7.7.1
+# --- Instagram (Use with caution) ---
+instaloader==4.11
+
+# -- NLP & Machine Learning --
+scikit-learn==1.5.0
+langdetect==1.0.9
+
+# -- Deep Learning (Vision & Language) --
+# --- PyTorch Core ---
+torch==2.3.1
+torchvision==0.18.1
+# --- Vision ---
+opencv-python-headless==4.9.0.80
+ultralytics==8.2.47
+Pillow==10.3.0
+# --- Language (Hugging Face for local models/experiments) ---
+transformers==4.41.2
+datasets==2.19.2
+accelerate==0.31.0
+bitsandbytes==0.43.1
+peft==0.11.1
+trl==0.9.4
+sentence-transformers==3.0.1
+
+# -- Cloud & API Clients --
+openai==1.35.7
+pinecone-client==4.1.1
+boto3 # For AWS S3 interaction (no version needed, will pull latest)
+s3fs # For pandas to interact with S3
+
+# -- API Server & UI --
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+pydantic==2.7.4
+streamlit==1.36.0
+
+# -- For Wake Word Detection --
+pvporcupine==1.9.5 # Note: Version might be important for model compatibility
+pyaudio==0.2.14
+
+# -- For AWS Services (Polly for Text-to-Speech) --
+boto3==1.34.144
