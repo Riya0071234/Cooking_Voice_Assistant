@@ -115,7 +115,7 @@ processing:
 # --- 3. Vision & Image Configuration ---
 vision_data:
   enabled: true
-  model_path: "models/vision/yolov8_ingredients.pt"
+  yolo_model_path: "models/vision/yolov8_ingredients.pt"
   confidence_threshold: 0.6
   frame_sampling_interval: 3
 
@@ -149,7 +149,7 @@ validation:
 training:
   enabled: true
   # For fine-tuning OpenAI model
-  model_to_fine_tune: "gpt-3.5-turbo"
+  openai_base_model: "gpt-3.5-turbo"
   # After fine-tuning, paste the resulting model ID here.
   fine_tuned_model_id: "ft:gpt-3.5-turbo-xxxxxxxx" # Example ID
   # Path to the processed Q&A data for fine-tuning

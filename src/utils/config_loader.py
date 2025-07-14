@@ -130,7 +130,7 @@ class ProcessingConfig(BaseModel):
 
 class VisionDataConfig(BaseModel):
     enabled: bool
-    model_path: str
+    yolo_model_path: str
     confidence_threshold: float
     frame_sampling_interval: int
 
@@ -158,7 +158,7 @@ class ValidationConfig(BaseModel):
 
 class TrainingConfig(BaseModel):
     enabled: bool
-    model_to_fine_tune: str
+    openai_base_model: str
     fine_tuned_model_id: str
     dataset_path: str
 
@@ -180,6 +180,7 @@ class FullConfig(BaseModel):
     rag: RagConfig
     recipe_sites: Dict[str, List[HttpUrl]]
     contextual_sources: ContextualSourcesConfig
+    youtube: YouTubeConfig
     scraping: ScrapingConfig
     processing: ProcessingConfig
     vision_data: VisionDataConfig
