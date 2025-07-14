@@ -1,39 +1,30 @@
 # src/scrapers/youtube_scraper.py
 """
-Scrapes YouTube for video metadata, transcripts, and comments.
-
-This module uses the YouTube Data API v3 to find videos from specified channels
-and then uses community libraries to fetch high-quality data for each video.
-
-Key Features:
-- Driven by the `config.yaml` file for channel lists and API keys.
-- Fetches video metadata, transcripts (multi-language), and top comments.
-- Validates all collected data with Pydantic for structural integrity.
-- Saves structured data to the raw data path for downstream processing.
+Scrapes YouTube for video metadata, transcripts, and comments,
+and saves the output directly to Amazon S3.
 """
-
 import logging
 import json
 import time
-from typing import List, Optional, Dict
+import isodate
+import boto3
 from pathlib import Path
-from pydantic import ValidationError
+from typing import List, Optional
+from botocore.exceptions import ClientError
 
 from googleapiclient.discovery import build
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
-from pydantic import BaseModel, HttpUrl, Field
+from pydantic import BaseModel, HttpUrl, ValidationError
 
 from src.utils.config_loader import get_config
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)-8s] [%(module)-20s] %(message)s')
 
 
 class YouTubeComment(BaseModel):
     author: str
     text: str
     like_count: int
-
 
 class YouTubeVideoData(BaseModel):
     video_id: str
@@ -49,17 +40,18 @@ class YouTubeVideoData(BaseModel):
 
 
 class YouTubeScraper:
-    """A class to handle scraping video data from YouTube."""
+    """A class to handle scraping video data from YouTube and saving to S3."""
 
     def __init__(self, config):
         self.config = config
         self.api_key = config.api_keys.youtube
-        self.max_results = config.youtube.max_results_per_channel
+        self.youtube_config = config.contextual_sources.youtube
+        self.max_results = self.youtube_config.max_results_per_channel
+        self.channel_ids = [channel_id for category in self.youtube_config.channels.values() for channel_id in category]
+        self.s3_client = boto3.client('s3')
         self.youtube_service = self._get_youtube_service()
-        self.channel_ids = [channel_id for category in config.youtube.channels.values() for channel_id in category]
 
     def _get_youtube_service(self):
-        """Initializes and returns the YouTube Data API service client."""
         try:
             return build('youtube', 'v3', developerKey=self.api_key)
         except Exception as e:
@@ -67,137 +59,96 @@ class YouTubeScraper:
             raise
 
     def get_video_ids_from_channels(self) -> List[str]:
-        """Gets a list of video IDs from the configured channels."""
         video_ids = []
-        if not self.youtube_service:
-            return []
-
+        if not self.youtube_service: return []
         logging.info(f"Fetching video IDs from {len(self.channel_ids)} channels.")
         for channel_id in self.channel_ids:
             try:
                 response = self.youtube_service.search().list(
-                    part='id',
-                    channelId=channel_id,
-                    maxResults=self.max_results,
-                    order='date',
-                    type='video'
+                    part='id', channelId=channel_id, maxResults=self.max_results, order='date', type='video'
                 ).execute()
-
-                for item in response.get('items', []):
-                    video_ids.append(item['id']['videoId'])
-
+                video_ids.extend([item['id']['videoId'] for item in response.get('items', [])])
                 time.sleep(self.config.scraping.delay_between_requests)
             except Exception as e:
                 logging.error(f"Could not fetch videos for channel {channel_id}: {e}")
-
-        logging.info(f"Found a total of {len(video_ids)} video IDs to process.")
-        return list(set(video_ids))  # Return unique video IDs
+        unique_ids = list(set(video_ids))
+        logging.info(f"Found a total of {len(unique_ids)} unique video IDs to process.")
+        return unique_ids
 
     def _get_transcript(self, video_id: str) -> Optional[str]:
-        """Fetches the full transcript for a video, trying English then Hindi."""
         try:
             transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['en', 'hi'])
             return " ".join([item['text'] for item in transcript_list])
         except (TranscriptsDisabled, NoTranscriptFound):
             logging.warning(f"No transcript found for video ID: {video_id}")
         except Exception as e:
-            logging.error(f"An unexpected error occurred fetching transcript for {video_id}: {e}")
+            logging.error(f"An unexpected error fetching transcript for {video_id}: {e}")
         return None
 
     def _get_comments(self, video_id: str) -> List[YouTubeComment]:
-        """Fetches the top-level comments for a video."""
         comments = []
-        if not self.config.contextual_sources.youtube.scrape_comments:
-            return comments
+        if not self.youtube_config.scrape_comments: return comments
         try:
             response = self.youtube_service.commentThreads().list(
-                part='snippet',
-                videoId=video_id,
-                maxResults=20,  # Fetch a reasonable number of top comments
-                textFormat='plainText'
+                part='snippet', videoId=video_id, maxResults=20, textFormat='plainText'
             ).execute()
-
             for item in response.get('items', []):
-                comment_snippet = item['snippet']['topLevelComment']['snippet']
-                comments.append(YouTubeComment(
-                    author=comment_snippet.get('authorDisplayName'),
-                    text=comment_snippet.get('textDisplay'),
-                    like_count=comment_snippet.get('likeCount', 0)
-                ))
-            return comments
+                snippet = item['snippet']['topLevelComment']['snippet']
+                comments.append(YouTubeComment(author=snippet.get('authorDisplayName'), text=snippet.get('textDisplay'), like_count=snippet.get('likeCount', 0)))
         except Exception as e:
-            # Often fails if comments are disabled
             logging.warning(f"Could not fetch comments for video {video_id}: {e}")
-            return []
+        return comments
 
-    def get_video_details(self, video_id: str) -> Optional[YouTubeVideoData]:
-        """Fetches all details for a single video and validates the data."""
+    def get_video_details(self, video_id: str) -> Optional[dict]:
         try:
-            response = self.youtube_service.videos().list(
-                part='snippet,contentDetails,statistics',
-                id=video_id
-            ).execute()
-
+            response = self.youtube_service.videos().list(part='snippet,contentDetails,statistics', id=video_id).execute()
             if not response.get('items'):
                 logging.warning(f"No video details found for ID: {video_id}")
                 return None
-
             item = response['items'][0]
             snippet = item['snippet']
-            # A simple regex to parse ISO 8601 duration format (e.g., PT1M35S)
-            import isodate
             duration_seconds = isodate.parse_duration(item['contentDetails']['duration']).total_seconds()
-
-            video_data = YouTubeVideoData(
-                video_id=video_id,
-                title=snippet['title'],
-                url=f"https://www.youtube.com/watch?v={video_id}",
-                description=snippet.get('description'),
-                channel_name=snippet.get('channelTitle'),
-                view_count=int(item['statistics'].get('viewCount', 0)),
-                length_seconds=int(duration_seconds),
-                publish_date=snippet.get('publishedAt'),
-                transcript=self._get_transcript(video_id),
+            validated_data = YouTubeVideoData(
+                video_id=video_id, title=snippet['title'], url=f"https://www.youtube.com/watch?v={video_id}",
+                description=snippet.get('description'), channel_name=snippet.get('channelTitle'),
+                view_count=int(item['statistics'].get('viewCount', 0)), length_seconds=int(duration_seconds),
+                publish_date=snippet.get('publishedAt'), transcript=self._get_transcript(video_id),
                 comments=self._get_comments(video_id)
             )
-            return video_data
+            # Convert to dict and ensure URL is a string for JSON serialization
+            final_dict = validated_data.dict()
+            final_dict['url'] = str(final_dict['url'])
+            return final_dict
         except ValidationError as e:
             logging.error(f"Data validation failed for video {video_id}: {e}")
         except Exception as e:
             logging.error(f"Failed to get details for video {video_id}: {e}")
         return None
 
+    def save_to_s3(self, data, s3_path: str):
+        if not data:
+            logging.warning("No YouTube data to save to S3.")
+            return
+        try:
+            bucket_name, key = s3_path.replace("s3://", "").split("/", 1)
+            logging.info(f"Uploading data for {len(data)} videos to S3 bucket '{bucket_name}'...")
+            self.s3_client.put_object(Bucket=bucket_name, Key=key, Body=json.dumps(data, indent=2, ensure_ascii=False), ContentType='application/json')
+            logging.info("✅ Successfully saved YouTube data to S3.")
+        except ClientError as e:
+            logging.error(f"Failed to upload YouTube data to S3: {e}")
+
     def run(self):
-        """Runs the full YouTube scraping process."""
         video_ids = self.get_video_ids_from_channels()
-        all_video_data = []
-
-        for video_id in video_ids:
-            logging.info(f"Processing video: {video_id}")
-            details = self.get_video_details(video_id)
-            if details:
-                all_video_data.append(details.dict())
-            time.sleep(self.config.scraping.delay_between_requests)
-
-        # Save to raw data path from config
-        output_path = Path(self.config.storage.raw_data_path)
-        output_path.mkdir(parents=True, exist_ok=True)
-        file_path = output_path / "scraped_youtube_videos.json"
-        with open(file_path, 'w', encoding='utf-8') as f:
-            json.dump(all_video_data, f, indent=2, ensure_ascii=False)
-        logging.info(f"✅ Saved data for {len(all_video_data)} videos to {file_path}")
-
+        all_video_data = [details for video_id in video_ids if (details := self.get_video_details(video_id))]
+        output_s3_path = self.config.storage.raw_data_path + "/scraped_youtube_videos.json"
+        self.save_to_s3(all_video_data, output_s3_path)
 
 def main():
-    """Main entry point for the script."""
     config = get_config()
     if not config.api_keys.youtube or "YOUR_YOUTUBE_API_KEY" in config.api_keys.youtube:
-        logging.error("YouTube API key is not configured in config.yaml. Aborting scrape.")
+        logging.error("YouTube API key is not configured. Aborting scrape.")
         return
-
-    scraper = YouTubeScraper(config)
-    scraper.run()
-
+    YouTubeScraper(config).run()
 
 if __name__ == "__main__":
     main()

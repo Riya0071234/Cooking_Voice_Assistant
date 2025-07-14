@@ -1,25 +1,21 @@
 # src/processing/vision_pipeline.py
 """
-Processes scraped YouTube videos to extract visual data.
+Processes scraped YouTube videos to extract visual data and saves it to S3.
 
 This pipeline downloads videos, samples frames at a configured interval,
 and runs a YOLO object detection model on each frame to identify ingredients
-and cooking utensils. The structured visual data is then saved for later use.
-
-Key Features:
-- Integrates with the output of the `youtube_scraper.py`.
-- Uses the powerful `ultralytics` YOLOv8 for object detection.
-- Fully configurable via the `vision_data` section of `config.yaml`.
-- Structures output using Pydantic models for data integrity.
-- Manages file cleanup to conserve disk space.
+and cooking utensils. The structured visual data and the frame images are
+then uploaded to an S3 bucket.
 """
 
 import logging
 import json
 import sys
 import cv2
+import boto3
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+from botocore.exceptions import ClientError
 
 from ultralytics import YOLO
 from pytube import YouTube
@@ -32,7 +28,7 @@ sys.path.append(str(project_root))
 from src.utils.config_loader import get_config
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)-8s] %(module)-25s] %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)-8s] [%(module)-25s] %(message)s')
 
 
 class DetectedObject(BaseModel):
@@ -45,44 +41,51 @@ class DetectedObject(BaseModel):
 class VisionFrameData(BaseModel):
     """Represents the complete visual analysis of a single video frame."""
     video_id: str
-    frame_filename: str
+    frame_s3_key: str  # The S3 key for the saved frame image
     timestamp_seconds: float
     detections: List[DetectedObject]
 
 
 class VisionDataCollector:
-    """Orchestrates the download and processing of video data."""
+    """Orchestrates the download, analysis, and upload of video data."""
 
     def __init__(self, config):
         self.config = config
         self.vision_config = config.vision_data
         self.storage_config = config.storage
-        self.raw_data_path = Path(self.storage_config.raw_data_path)
-        self.vision_output_path = Path(self.storage_config.vision_data_path)
+        self.raw_data_path = self.storage_config.raw_data_path
+        self.vision_output_path = self.storage_config.vision_data_path
 
-        logging.info(f"Loading YOLO model from: {self.vision_config.model_path}")
-        self.yolo_model = YOLO(self.vision_config.model_path)
-        logging.info("YOLO model loaded successfully.")
+        # In a production system, you might download the model from S3 if it doesn't exist locally
+        logging.info(f"Loading YOLO model from: {self.vision_config.yolo_model_path}")
+        self.yolo_model = YOLO(self.vision_config.yolo_model_path)
+        self.s3_client = boto3.client('s3')
+        logging.info("YOLO model and S3 client initialized successfully.")
 
     def _load_scraped_videos(self) -> List[Dict[str, Any]]:
-        """Loads the list of videos scraped by youtube_scraper.py."""
-        video_file = self.raw_data_path / "scraped_youtube_videos.json"
-        if not video_file.exists():
-            logging.error(f"Video data file not found at {video_file}. Please run the YouTube scraper first.")
-            return []
-        with open(video_file, 'r', encoding='utf-8') as f:
-            return json.load(f)
+        """Loads the list of videos scraped by youtube_scraper.py from S3."""
+        s3_path = self.raw_data_path + "/scraped_youtube_videos.json"
+        try:
+            bucket_name, key = s3_path.replace("s3://", "").split("/", 1)
+            response = self.s3_client.get_object(Bucket=bucket_name, Key=key)
+            content = response['Body'].read().decode('utf-8')
+            return json.loads(content)
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'NoSuchKey':
+                logging.error(f"Video data file not found at {s3_path}. Please run the YouTube scraper first.")
+            else:
+                logging.error(f"Failed to load video data from S3: {e}")
+        return []
 
     def _process_video(self, video_info: Dict[str, Any]) -> List[VisionFrameData]:
         """Downloads, analyzes, and cleans up a single video."""
         video_id = video_info.get("video_id")
         video_url = video_info.get("url")
-        if not video_id or not video_url:
-            return []
+        if not video_id or not video_url: return []
 
         logging.info(f"--- Processing video ID: {video_id} ---")
         video_frames_data = []
-        video_path = None
+        video_path: Optional[Path] = None
 
         try:
             # Step 1: Download the video
@@ -92,12 +95,13 @@ class VisionDataCollector:
                 logging.error(f"No suitable stream found for video {video_id}")
                 return []
 
-            download_dir = self.vision_output_path / "temp_videos"
-            download_dir.mkdir(parents=True, exist_ok=True)
-            logging.info(f"Downloading '{yt.title}'...")
-            video_path = Path(stream.download(output_path=str(download_dir)))
+            # Use a temporary local directory for downloads
+            temp_dir = Path("/tmp/video_downloads")
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            logging.info(f"Downloading '{yt.title}' to temporary location...")
+            video_path = Path(stream.download(output_path=str(temp_dir)))
 
-            # Step 2: Process frames
+            # Step 2: Process frames and upload to S3
             cap = cv2.VideoCapture(str(video_path))
             fps = cap.get(cv2.CAP_PROP_FPS)
             frame_interval = int(fps * self.vision_config.frame_sampling_interval)
@@ -105,56 +109,53 @@ class VisionDataCollector:
             frame_count = 0
             while cap.isOpened():
                 success, frame = cap.read()
-                if not success:
-                    break
+                if not success: break
 
                 if frame_count % frame_interval == 0:
                     timestamp = frame_count / fps
-                    logging.info(f"  - Analyzing frame at {timestamp:.2f}s")
 
                     # Run YOLO detection
                     results = self.yolo_model(frame, verbose=False)
-                    detected_objects = []
-                    for res in results:
-                        for box in res.boxes:
-                            detected_objects.append(DetectedObject(
-                                label=res.names[int(box.cls)],
-                                confidence=float(box.conf),
-                                box=[int(coord) for coord in box.xyxy[0]]
-                            ))
+                    detections = [
+                        DetectedObject(label=res.names[int(box.cls)], confidence=float(box.conf),
+                                       box=[int(c) for c in box.xyxy[0]])
+                        for res in results for box in res.boxes
+                    ]
 
-                    # Save frame image
-                    frame_dir = self.vision_output_path / "frames" / video_id
-                    frame_dir.mkdir(parents=True, exist_ok=True)
+                    # Encode frame to memory buffer and upload to S3
+                    success, buffer = cv2.imencode('.jpg', frame)
+                    if not success: continue
+
                     frame_filename = f"frame_{frame_count}.jpg"
-                    frame_filepath = frame_dir / frame_filename
-                    cv2.imwrite(str(frame_filepath), frame)
+                    s3_bucket, base_key = self.vision_output_path.replace("s3://", "").split("/", 1)
+                    frame_s3_key = f"{base_key}/frames/{video_id}/{frame_filename}"
+
+                    self.s3_client.put_object(Bucket=s3_bucket, Key=frame_s3_key, Body=buffer.tobytes(),
+                                              ContentType='image/jpeg')
 
                     video_frames_data.append(VisionFrameData(
                         video_id=video_id,
-                        frame_filename=frame_filename,
+                        frame_s3_key=frame_s3_key,
                         timestamp_seconds=timestamp,
-                        detections=detected_objects
+                        detections=detections
                     ))
                 frame_count += 1
 
             cap.release()
+            logging.info(f"  Processed and uploaded {len(video_frames_data)} frames for video {video_id}.")
 
         except Exception as e:
             logging.exception(f"An error occurred while processing video {video_id}: {e}")
         finally:
-            # Step 3: Clean up downloaded video file
             if video_path and video_path.exists():
-                video_path.unlink()
-                logging.info(f"Cleaned up video file: {video_path.name}")
+                video_path.unlink()  # Clean up downloaded video file
 
         return video_frames_data
 
     def run(self):
         """Main function to run the entire vision data collection process."""
         videos_to_process = self._load_scraped_videos()
-        if not videos_to_process:
-            return
+        if not videos_to_process: return
 
         all_vision_data = []
         for video_info in videos_to_process:
@@ -165,14 +166,17 @@ class VisionDataCollector:
             logging.warning("No vision data was generated in this run.")
             return
 
-        # Save all metadata to a single JSON file
-        output_file = self.vision_output_path / "vision_metadata.json"
-        # Convert Pydantic objects to dicts for JSON serialization
-        data_to_save = [item.dict() for item in all_vision_data]
-        with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(data_to_save, f, indent=2)
-
-        logging.info(f"✅ Vision pipeline complete. Saved metadata for {len(all_vision_data)} frames to {output_file}.")
+        # Save all metadata to a single JSON file in S3
+        output_s3_path = self.vision_output_path + "/vision_metadata.json"
+        try:
+            bucket_name, key = output_s3_path.replace("s3://", "").split("/", 1)
+            data_to_save = [item.dict() for item in all_vision_data]
+            self.s3_client.put_object(Bucket=bucket_name, Key=key, Body=json.dumps(data_to_save, indent=2),
+                                      ContentType='application/json')
+            logging.info(
+                f"✅ Vision pipeline complete. Saved metadata for {len(all_vision_data)} frames to {output_s3_path}.")
+        except ClientError as e:
+            logging.error(f"Failed to upload vision metadata to S3: {e}")
 
 
 def main():
@@ -182,8 +186,7 @@ def main():
         logging.warning("Vision pipeline is disabled in the configuration. Skipping.")
         return
 
-    collector = VisionDataCollector(config)
-    collector.run()
+    VisionDataCollector(config).run()
 
 
 if __name__ == "__main__":

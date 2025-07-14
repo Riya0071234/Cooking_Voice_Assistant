@@ -1,45 +1,34 @@
 # src/scrapers/social_scraper.py
 """
-Scrapes contextual Question & Answer data from social media and forums.
-
-This module is responsible for gathering real-world cooking problems,
-questions, and solutions from sources like Reddit, Quora, and Instagram.
-
---- PLATFORM RELIABILITY ---
-- Reddit:   HIGH. Uses the official PRAW API and is reliable.
-- Instagram: LOW. Requires login, is heavily rate-limited, and can get your
-             account flagged. Use with extreme caution. Provided conceptually.
-- Quora:     LOW. Relies on web scraping, which can break easily if Quora
-             changes its website's HTML structure.
-- Facebook:  VERY LOW. Not implemented due to strong anti-scraping measures
-             that make reliable scraping nearly impossible without private APIs.
+Scrapes contextual Q&A data from Reddit, Instagram, and Quora,
+and saves the aggregated results directly to Amazon S3.
 """
 
 import logging
 import json
 import time
+import os
+import boto3
 from pathlib import Path
 from typing import List, Optional
+from botocore.exceptions import ClientError
+from itertools import islice
 
 import praw
+import instaloader
 import requests
 from bs4 import BeautifulSoup
-from pydantic import BaseModel, HttpUrl, Field
-
-# Uncomment the line below if you decide to use the Instagram scraper
-# import instaloader
 
 from src.utils.config_loader import get_config
-from src.models.sql_models import ContextualEntry  # Used for structure reference
+from pydantic import BaseModel, HttpUrl, Field, ValidationError
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)-8s] [%(module)-20s] %(message)s')
 
 
 class ContextualPost(BaseModel):
     """Pydantic model to validate scraped Q&A-style data."""
-    question: str = Field(..., min_length=15)
-    answer: str = Field(..., min_length=20)
+    question: str
+    answer: str
     source_platform: str
     source_url: HttpUrl
     intent: str = "troubleshooting"
@@ -47,15 +36,16 @@ class ContextualPost(BaseModel):
 
 
 class SocialScraper:
-    """
-    A class to handle scraping contextual Q&A from various social platforms.
-    """
+    """Handles scraping from various social platforms and saves to S3."""
 
     def __init__(self, config):
         self.config = config
         self.reddit_config = config.contextual_sources.forums.reddit
+        self.quora_config = config.contextual_sources.forums.quora
         self.insta_config = config.contextual_sources.social_media.instagram
         self.keywords = config.scraping.contextual_keywords
+
+        self.s3_client = boto3.client('s3')
         self.reddit_client = self._initialize_reddit_client()
         self.insta_client = self._initialize_insta_client()
         self.http_session = requests.Session()
@@ -64,125 +54,136 @@ class SocialScraper:
         })
 
     def _initialize_reddit_client(self):
-        """Initializes the PRAW Reddit client using credentials from the config."""
-        if not self.reddit_config.enabled:
-            return None
+        if not self.reddit_config.enabled: return None
         try:
-            client = praw.Reddit(
-                client_id=self.config.api_keys.reddit_client_id,
-                client_secret=self.config.api_keys.reddit_client_secret,
-                user_agent=self.config.api_keys.reddit_user_agent,
-                read_only=True
-            )
-            logging.info("Reddit (PRAW) client initialized successfully.")
+            client = praw.Reddit(client_id=self.config.api_keys.reddit_client_id,
+                                 client_secret=self.config.api_keys.reddit_client_secret,
+                                 user_agent=self.config.api_keys.reddit_user_agent, read_only=True)
+            logging.info("✅ Reddit (PRAW) client initialized successfully.")
             return client
         except Exception as e:
-            logging.error(f"Failed to initialize Reddit client: {e}")
+            logging.error(f"❌ Failed to initialize Reddit client: {e}")
             return None
 
     def _initialize_insta_client(self):
-        """Initializes the Instaloader client. Requires manual configuration."""
-        if not self.insta_config.enabled:
+        if not self.insta_config.enabled: return None
+        user, pwd = os.getenv("INSTAGRAM_USER"), os.getenv("INSTAGRAM_PASSWORD")
+        if not user or not pwd:
+            logging.error("❌ INSTAGRAM_USER and INSTAGRAM_PASSWORD not found. Disabling Instagram scraping.")
             return None
-        logging.warning(
-            "Instagram scraping is highly unstable and can get your account banned. The functionality is provided conceptually. To enable, uncomment the code in this function and in your requirements.txt, then provide your credentials.")
-        # try:
-        #     L = instaloader.Instaloader()
-        #     # ---- DANGER: THIS REQUIRES YOUR REAL USERNAME AND PASSWORD ----
-        #     # L.login("YOUR_INSTAGRAM_USERNAME", "YOUR_INSTAGRAM_PASSWORD")
-        #     logging.info("Instaloader client initialized.")
-        #     return L
-        # except Exception as e:
-        #     logging.error(f"Failed to initialize Instaloader: {e}")
-        return None
+        try:
+            L = instaloader.Instaloader()
+            L.login(user, pwd)
+            logging.info(f"✅ Instagram client initialized and logged in as '{user}'.")
+            return L
+        except Exception as e:
+            logging.error(f"❌ Failed to initialize Instagram client: {e}")
+            return None
 
     def _scrape_reddit(self) -> List[ContextualPost]:
-        """Scrapes relevant posts and their top comments from configured subreddits."""
-        if not self.reddit_client:
-            return []
-
-        all_posts = []
+        if not self.reddit_client: return []
+        posts = []
         search_query = " OR ".join(f'"{kw}"' for kw in self.keywords)
-
         for sub_name in self.reddit_config.subreddits:
-            logging.info(f"Scraping subreddit: r/{sub_name}")
             try:
                 subreddit = self.reddit_client.subreddit(sub_name)
-                for submission in subreddit.search(search_query, limit=50, sort='comments'):
+                for submission in subreddit.search(search_query, limit=25, sort='comments'):
                     if submission.is_self and not submission.stickied and submission.num_comments > 0:
                         submission.comments.replace_more(limit=0)
-                        if not submission.comments: continue
-
-                        top_comment = submission.comments[0]
-                        if top_comment.body and len(top_comment.body) > 20:
-                            post = ContextualPost(
-                                question=submission.title,
-                                answer=top_comment.body,
-                                source_platform="Reddit",
-                                source_url=f"https://www.reddit.com{submission.permalink}",
-                                score=submission.score
-                            )
-                            all_posts.append(post)
+                        if submission.comments and submission.comments[0].body and len(
+                                submission.comments[0].body) > 20:
+                            posts.append(ContextualPost(question=submission.title, answer=submission.comments[0].body,
+                                                        source_platform="Reddit",
+                                                        source_url=f"https://www.reddit.com{submission.permalink}",
+                                                        score=submission.score))
                 time.sleep(self.config.scraping.delay_between_requests)
             except Exception as e:
                 logging.error(f"Failed to scrape r/{sub_name}: {e}")
-
-        logging.info(f"Scraped {len(all_posts)} posts from Reddit.")
-        return all_posts
+        logging.info(f"Scraped {len(posts)} posts from Reddit.")
+        return posts
 
     def _scrape_instagram(self) -> List[ContextualPost]:
-        """Conceptual function for scraping Instagram."""
-        if not self.insta_client:
-            return []
-        logging.info("Executing conceptual Instagram scraping function.")
-        # The logic here would be complex: iterate through accounts, get posts,
-        # filter by keywords in captions, and then fetch comments for matched posts.
-        # This is left as a placeholder due to the high risk and instability.
-        return []
+        if not self.insta_client: return []
+        posts = []
+        for account in self.insta_config.accounts:
+            try:
+                profile = instaloader.Profile.from_username(self.insta_client.context, account)
+                for post in islice(profile.get_posts(), 15):  # Limit to recent posts
+                    if post.caption and any(kw in post.caption.lower() for kw in self.keywords):
+                        top_comment = next(post.get_comments(), None)
+                        posts.append(ContextualPost(question=post.caption[:300],
+                                                    answer=top_comment.text if top_comment else "No answer found.",
+                                                    source_platform="Instagram",
+                                                    source_url=f"https://www.instagram.com/p/{post.shortcode}/",
+                                                    score=post.likes))
+                time.sleep(self.config.scraping.delay_between_requests * 5)
+            except Exception as e:
+                logging.error(f"Failed to scrape Instagram account {account}: {e}")
+        logging.info(f"Scraped {len(posts)} posts from Instagram.")
+        return posts
 
     def _scrape_quora(self) -> List[ContextualPost]:
-        """Conceptual function for scraping Quora."""
-        logging.warning("Quora scraping is brittle and left as a placeholder.")
-        return []
-
-    def _scrape_facebook(self) -> List[ContextualPost]:
-        """Conceptual function for scraping Facebook."""
-        logging.warning("Facebook scraping is not feasible and is disabled.")
-        return []
+        if not self.quora_config.enabled: return []
+        posts = []
+        logging.info("Starting Quora scraping (best-effort).")
+        for topic in self.quora_config.topics:
+            try:
+                search_url = f"https://www.quora.com/search?q=cooking+{topic.lower()}"
+                response = self.http_session.get(search_url)
+                soup = BeautifulSoup(response.text, 'html.parser')
+                # This selector is brittle and may need updating if Quora changes their site
+                question_links = soup.select('a.q-box.qu-cursor--pointer')
+                for link in islice(question_links, 5):
+                    question_url = "https://www.quora.com" + link['href']
+                    question_text = link.get_text(strip=True)
+                    if len(question_text) > 15:
+                        posts.append(ContextualPost(question=question_text,
+                                                    answer="Answer context would be scraped from the linked page.",
+                                                    source_platform="Quora", source_url=question_url))
+                time.sleep(self.config.scraping.delay_between_requests)
+            except Exception as e:
+                logging.error(f"Failed to scrape Quora topic '{topic}': {e}")
+        logging.info(f"Scraped {len(posts)} questions from Quora.")
+        return posts
 
     def run(self):
-        """Runs the full social scraping process and saves data to a file."""
-        logging.info("Starting social media and forum scraping.")
-
-        # Execute each scraper function
+        """Runs the full social scraping process and saves data to S3."""
         reddit_posts = self._scrape_reddit()
         instagram_posts = self._scrape_instagram()
         quora_posts = self._scrape_quora()
-        facebook_posts = self._scrape_facebook()
+        all_posts = reddit_posts + instagram_posts + quora_posts
 
-        all_contextual_posts = reddit_posts + instagram_posts + quora_posts + facebook_posts
-
-        if not all_contextual_posts:
+        if not all_posts:
             logging.warning("No contextual posts were scraped in this run.")
             return
 
-        output_path = Path(self.config.storage.raw_data_path)
-        output_path.mkdir(parents=True, exist_ok=True)
-        file_path = output_path / "scraped_contextual_posts.json"
+        posts_as_dicts = []
+        for post in all_posts:
+            try:
+                post_dict = post.dict()
+                post_dict['source_url'] = str(post.source_url)  # Ensure URL is a string for JSON
+                posts_as_dicts.append(post_dict)
+            except ValidationError as e:
+                logging.warning(f"Skipping a post due to validation error: {e}")
 
-        posts_as_dicts = [post.dict() for post in all_contextual_posts]
-
-        with open(file_path, 'w', encoding='utf-8') as f:
-            json.dump(posts_as_dicts, f, indent=2, ensure_ascii=False)
-
-        logging.info(f"✅ Saved {len(all_contextual_posts)} total contextual posts to {file_path}")
+        # Construct S3 path and save data
+        output_s3_path = self.config.storage.contextual_data_path + "/scraped_social_posts.json"
+        try:
+            bucket_name, key = output_s3_path.replace("s3://", "").split("/", 1)
+            logging.info(f"Uploading {len(posts_as_dicts)} posts to S3 bucket '{bucket_name}'...")
+            self.s3_client.put_object(
+                Bucket=bucket_name, Key=key,
+                Body=json.dumps(posts_as_dicts, indent=2, ensure_ascii=False),
+                ContentType='application/json'
+            )
+            logging.info("✅ Successfully saved social data to S3.")
+        except ClientError as e:
+            logging.error(f"Failed to upload to S3: {e}")
 
 
 def main():
-    """Main entry point for the script."""
     config = get_config()
-    scraper = SocialScraper(config)
-    scraper.run()
+    SocialScraper(config).run()
 
 
 if __name__ == "__main__":
